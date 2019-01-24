@@ -1,16 +1,16 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
-	"errors"
 
-
-	"github.com/qiniu/api.v7/auth/qbox"
-	"github.com/qiniu/api.v7/storage"
-	"fmt"
+	"github.com/gorilla/mux"
+	"go.zoe.im/knife-go/convert"
+	"go.zoe.im/s3-qiniu/qiniu"
 )
 
 var (
@@ -24,22 +24,20 @@ var (
 	bucket     = flag.String("bucket", "", "Default bucket for s3-qiniu.")
 	enablePage = flag.Bool("enable_page", false, "Enable list page of bucket.")
 	wildMode   = flag.Bool("wild_mode", true, "Access bucket dynamic for s3-qiniu.")
-
-	urlLayout = flag.String("params_layout", defaultUrlLayout, "Define template to parse params.")
 )
 
-type s3 struct {
+type service struct {
 	addr, accessKey, secretKey       string
 	defaultBucket                    string
 	enablePage                       bool
 	wildMode                         bool
 	whiteBucketList, blackBucketList []string
 
-	bm *storage.BucketManager
+	*qiniu.S3
 }
 
-func NewS3() (*s3, error) {
-	s := &s3{
+func newService() (*service, error) {
+	s := &service{
 		addr:          *addr,
 		accessKey:     *access,
 		secretKey:     *secret,
@@ -59,44 +57,72 @@ func NewS3() (*s3, error) {
 
 	// do prepare checker
 	if s.accessKey == "" {
-		return nil, errors.New("empty access key.")
+		return nil, errors.New("empty access key")
 	}
 
 	if s.secretKey == "" {
-		return nil, errors.New("empty secret key.")
+		return nil, errors.New("empty secret key")
 	}
 
 	if s.defaultBucket == "" && !s.wildMode {
-		return nil, errors.New("you must offer a bucket name or use wild mode.")
+		return nil, errors.New("you must offer a bucket name or use wild mode")
 	}
 
-	// init with server and check with server
-	mac := qbox.NewMac(s.accessKey, s.secretKey)
-	s.bm = storage.NewBucketManager(mac, &storage.Config{})
+	var err error
 
-	_, err := s.bm.Buckets(false)
+	s.S3, err = qiniu.NewS3(qiniu.AccessKey(s.accessKey), qiniu.SecretKey(s.secretKey))
 	if err != nil {
-		return nil, fmt.Errorf("init qiniu qbox ends with error: %s", err)
+		return nil, err
 	}
-
-	// it's really for serve
 
 	return s, nil
 }
 
-func (s *s3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	vars := mux.Vars(r)
+
+	bucket := vars["bucket"]
+	objectID := vars["key"]
+
+	info, err := s.Stat(bucket, objectID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write(convert.String2Bytes(err.Error()))
+		return
+	}
+
+	if r.URL.Query().Get("stat") == "true" {
+		data, _ := json.Marshal(info)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return
+	}
+
+	w.Header().Set("Location", info.URL)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusTemporaryRedirect)
 
 	return
 }
 
 func main() {
 
-	handler, err := NewS3()
+	flag.Parse()
+
+	handler, err := newService()
+
+	r := mux.NewRouter()
+	r.PathPrefix("/{bucket}/{key}").Handler(handler)
+
 	if err != nil {
 		log.Printf("Init s3 with error: %s.\n", err)
+		return
 	}
 
-	if err := http.ListenAndServe(*addr, handler); err != nil {
+	if err := http.ListenAndServe(*addr, r); err != nil {
 		log.Printf("Exit with error: %s.\n", err)
 	}
+
+	log.Println("exit s3-qiniu")
 }
